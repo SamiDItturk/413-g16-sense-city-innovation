@@ -1,0 +1,47 @@
+#include <Arduino_APDS9960.h> // Include APDS9960 sensor library
+
+// Pin definition for all LEDs
+#define LED_PIN 2  // Connect all LEDs to this pin
+
+void setup() {
+  // Start Serial Monitor
+  Serial.begin(9600);
+  while (!Serial); // Wait for serial connection
+
+  // Initialize the APDS9960 sensor
+  if (!APDS.begin()) { // Check if initialization fails
+    Serial.println("Failed to initialize APDS9960 sensor!");
+    while (1); // Halt program if sensor fails
+  }
+  Serial.println("APDS9960 Sensor Initialized.");
+
+  // Set LED pin as output
+  pinMode(LED_PIN, OUTPUT);
+
+  // Ensure LEDs are off initially
+  digitalWrite(LED_PIN, LOW);
+}
+
+void loop() {
+  // Check if proximity data is available
+  if (APDS.proximityAvailable()) {
+    // Read proximity value
+    int proximity = APDS.readProximity(); // 0 = far, 255 = close
+
+    // Print proximity data to Serial Monitor
+    Serial.print("Proximity: ");
+    Serial.println(proximity);
+
+    // Turn on LEDs when an object is close (proximity within range)
+    if (proximity < 50) {  // Adjust this value for your desired distance
+      Serial.println("Object detected, turning on LEDs...");
+      digitalWrite(LED_PIN, HIGH); // Turn on all LEDs
+    } else {
+      // Turn off LEDs when no object is close
+      Serial.println("No object detected, turning off LEDs...");
+      digitalWrite(LED_PIN, LOW); // Turn off all LEDs
+    }
+  }
+
+  delay(100); // Wait 100ms before reading again
+}
