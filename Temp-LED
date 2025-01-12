@@ -1,0 +1,52 @@
+#include <Arduino_HS300x.h> // Include the HS300x library
+
+// Define LED pins for temperature ranges
+const int yellowLED = 4; // Yellow LED for temperatures 0-24°C
+const int blueLED = 5;   // Blue LED for temperatures >24°C
+
+void setup() {
+  // Start Serial Monitor
+  Serial.begin(9600);
+  while (!Serial); // Wait for Serial Monitor to open
+
+  // Initialize the HS3003 sensor
+  if (!HS300x.begin()) { // Check if initialization fails
+    Serial.println("Failed to initialize HS3003 sensor!");
+    while (1); // Halt program if sensor fails
+  }
+
+  Serial.println("HS3003 Sensor Initialized.");
+
+  // Set LED pins as OUTPUT
+  pinMode(yellowLED, OUTPUT);
+  pinMode(blueLED, OUTPUT);
+
+  // Ensure all LEDs are initially OFF
+  digitalWrite(yellowLED, LOW);
+  digitalWrite(blueLED, LOW);
+}
+
+void loop() {
+  // Read temperature
+  float temperature = HS300x.readTemperature(); // Read temperature in °C
+
+  // Print temperature to Serial Monitor
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" °C");
+
+  // Control LEDs based on temperature range
+  if (temperature >= 0 && temperature <= 29) {
+    digitalWrite(yellowLED, HIGH); // Turn on yellow LED
+    digitalWrite(blueLED, LOW);
+  } else if (temperature > 30) {
+    digitalWrite(yellowLED, LOW);
+    digitalWrite(blueLED, HIGH); // Turn on blue LED
+  } else {
+    // Ensure all LEDs are off if temperature is out of expected range
+    digitalWrite(yellowLED, LOW);
+    digitalWrite(blueLED, LOW);
+  }
+
+  delay(1000); // Wait 1 second before next reading
+}
