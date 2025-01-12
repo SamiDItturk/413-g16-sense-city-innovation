@@ -86,3 +86,5 @@ To replicate this project, you will need the following components:
 - Adjust thresholds in the code to customize LED activation for your application.
 - Visit [Edge Impulse Documentation](https://docs.edgeimpulse.com) for more details on training and deploying TinyML models.
 
+- Link for video demo:  https://drive.google.com/file/d/125qKZEDZ_3fa3YO8BTRBxnLc04Vd4d-w/view?pli=1
+
