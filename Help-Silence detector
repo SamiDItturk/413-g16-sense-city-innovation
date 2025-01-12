@@ -1,0 +1,276 @@
+/* Edge Impulse ingestion SDK
+ * Copyright (c) 2022 EdgeImpulse Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Define this macro to save 10K RAM if your target device is memory-constrained
+#define EIDSP_QUANTIZE_FILTERBANK 0
+
+/**
+ * Define the number of slices per model window. For example, a model window of 1000 ms
+ * with slices per model window set to 4 results in a slice size of 250 ms.
+ * More info: https://docs.edgeimpulse.com/docs/continuous-audio-sampling
+ */
+#define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW 4
+
+/*
+ ** NOTE: If you run into TFLite arena allocation issues:
+ **
+ ** This might be due to dynamic memory fragmentation.
+ ** You can try defining "-DEI_CLASSIFIER_ALLOCATION_STATIC" in the boards.local.txt file.
+ ** Create this file if it does not exist, and place it at:
+ ** <ARDUINO_CORE_INSTALL_PATH>/arduino/hardware/<mbed_core>/<core_version>/.
+ **
+ ** See the following article to locate Arduino core installations:
+ ** (https://support.arduino.cc/hc/en-us/articles/360012076960-Where-are-the-installed-cores-located-)
+ **
+ ** If the problem persists, the model and application may require more memory than available.
+ */
+
+/* Includes ---------------------------------------------------------------- */
+#include <PDM.h>                           // Include PDM library for microphone input
+#include <cerenx-project-1_inferencing.h>  // Include Edge Impulse TinyML library
+
+/** Audio buffers, pointers, and selectors */
+typedef struct {
+    signed short *buffers[2]; // Two buffers to store audio data
+    unsigned char buf_select; // Current buffer index
+    unsigned char buf_ready;  // Indicates if buffer is ready
+    unsigned int buf_count;   // Number of samples in the buffer
+    unsigned int n_samples;   // Total samples per buffer
+} inference_t;
+
+static inference_t inference;             // Inference structure instance
+static bool record_ready = false;         // Flag to indicate if recording is ready
+static signed short *sampleBuffer;        // Buffer for audio samples
+static bool debug_nn = false;             // Enable to debug the neural network
+static int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW); // Counter for results printing
+
+// Define pin for "Help" detection
+#define HELP_PIN 5
+unsigned long helpDetectedTime = 0; // Time when "Help" was last detected
+bool helpActive = false;            // Flag to track if "Help" signal is active
+
+/**
+ * @brief      Arduino setup function
+ */
+void setup()
+{
+    // Initialize the Serial Monitor
+    Serial.begin(115200);
+    // Wait for USB connection (needed for native USB devices)
+    while (!Serial);
+    Serial.println("Edge Impulse Inferencing Demo");
+
+    // Initialize the "Help" detection pin
+    pinMode(HELP_PIN, OUTPUT);
+    digitalWrite(HELP_PIN, LOW); // Ensure pin is initially off
+
+    // Print model settings from model_metadata.h
+    ei_printf("Inferencing settings:\n");
+    ei_printf("\tInterval: %.2f ms.\n", (float)EI_CLASSIFIER_INTERVAL_MS);
+    ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+    ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
+    ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) /
+                                            sizeof(ei_classifier_inferencing_categories[0]));
+
+    // Initialize the Edge Impulse classifier
+    run_classifier_init();
+
+    // Start PDM audio sampling
+    if (microphone_inference_start(EI_CLASSIFIER_SLICE_SIZE) == false) {
+        ei_printf("ERR: Could not allocate audio buffer (size %d).\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT);
+        return;
+    }
+}
+
+/**
+ * @brief      Arduino main function. Runs the inferencing loop.
+ */
+void loop()
+{
+    // Record audio data
+    bool m = microphone_inference_record();
+    if (!m) {
+        ei_printf("ERR: Failed to record audio...\n");
+        return;
+    }
+
+    // Prepare the signal structure for Edge Impulse
+    signal_t signal;
+    signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
+    signal.get_data = &microphone_audio_signal_get_data;
+    ei_impulse_result_t result = {0};
+
+    // Run the Edge Impulse classifier
+    EI_IMPULSE_ERROR r = run_classifier_continuous(&signal, &result, debug_nn);
+    if (r != EI_IMPULSE_OK) {
+        ei_printf("ERR: Failed to run classifier (%d)\n", r);
+        return;
+    }
+
+    // Print classification results after processing the defined number of slices
+    if (++print_results >= (EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW)) {
+        ei_printf("Predictions:\n");
+        for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+            ei_printf("    %s: %.5f\n", result.classification[ix].label, result.classification[ix].value);
+
+            // Turn on HELP_PIN if "Help" is detected with confidence >= 0.9
+            if (strcmp(result.classification[ix].label, "Help") == 0 && result.classification[ix].value >= 0.9000) {
+                if (!helpActive) { // Only activate if not already active
+                    digitalWrite(HELP_PIN, HIGH);
+                    helpDetectedTime = millis(); // Record the time "Help" was detected
+                    helpActive = true;
+                }
+            }
+        }
+#if EI_CLASSIFIER_HAS_ANOMALY == 1
+        ei_printf("    Anomaly score: %.3f\n", result.anomaly);
+#endif
+        print_results = 0; // Reset result counter
+    }
+
+    // Turn off HELP_PIN after 5 seconds if "Help" was detected
+    if (helpActive && (millis() - helpDetectedTime >= 5000)) {
+        digitalWrite(HELP_PIN, LOW);
+        helpActive = false;
+    }
+}
+
+/**
+ * @brief      Callback for PDM buffer full event
+ *             Reads data into the inference buffers.
+ */
+static void pdm_data_ready_inference_callback(void)
+{
+    int bytesAvailable = PDM.available();
+
+    // Read audio data into the sample buffer
+    int bytesRead = PDM.read((char *)&sampleBuffer[0], bytesAvailable);
+
+    // Copy audio samples to inference buffer if recording is active
+    if (record_ready == true) {
+        for (int i = 0; i < bytesRead >> 1; i++) {
+            inference.buffers[inference.buf_select][inference.buf_count++] = sampleBuffer[i];
+
+            // Switch buffer when full
+            if (inference.buf_count >= inference.n_samples) {
+                inference.buf_select ^= 1; // Toggle buffer index
+                inference.buf_count = 0;
+                inference.buf_ready = 1;  // Mark buffer as ready
+            }
+        }
+    }
+}
+
+/**
+ * @brief      Initializes audio sampling for Edge Impulse inferencing.
+ *
+ * @param[in]  n_samples  The number of samples per buffer.
+ *
+ * @return     True if successful, false otherwise.
+ */
+static bool microphone_inference_start(uint32_t n_samples)
+{
+    // Allocate buffers for audio data
+    inference.buffers[0] = (signed short *)malloc(n_samples * sizeof(signed short));
+    if (inference.buffers[0] == NULL) {
+        return false;
+    }
+
+    inference.buffers[1] = (signed short *)malloc(n_samples * sizeof(signed short));
+    if (inference.buffers[1] == NULL) {
+        free(inference.buffers[0]);
+        return false;
+    }
+
+    sampleBuffer = (signed short *)malloc((n_samples >> 1) * sizeof(signed short));
+    if (sampleBuffer == NULL) {
+        free(inference.buffers[0]);
+        free(inference.buffers[1]);
+        return false;
+    }
+
+    inference.buf_select = 0; // Start with buffer 0
+    inference.buf_count = 0;  // No samples initially
+    inference.n_samples = n_samples;
+    inference.buf_ready = 0;  // Buffer not ready initially
+
+    // Configure the PDM microphone
+    PDM.onReceive(&pdm_data_ready_inference_callback);
+    PDM.setBufferSize((n_samples >> 1) * sizeof(int16_t));
+
+    // Start PDM microphone with mono channel and 16 kHz sampling rate
+    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {
+        ei_printf("Failed to start PDM!\n");
+    }
+
+    PDM.setGain(127); // Set microphone gain
+    record_ready = true;
+
+    return true;
+}
+
+/**
+ * @brief      Records audio data for inference.
+ *
+ * @return     True if successful, false otherwise.
+ */
+static bool microphone_inference_record(void)
+{
+    bool ret = true;
+
+    // Check for buffer overruns
+    if (inference.buf_ready == 1) {
+        ei_printf("Error: Sample buffer overrun.\n");
+        ret = false;
+    }
+
+    // Wait for buffer to be ready
+    while (inference.buf_ready == 0) {
+        delay(1);
+    }
+
+    inference.buf_ready = 0; // Clear buffer ready flag
+    return ret;
+}
+
+/**
+ * @brief      Converts raw audio signal data to floating point.
+ *
+ * @param[in]  offset  The starting offset in the buffer.
+ * @param[in]  length  The number of samples to convert.
+ * @param[out] out_ptr The output pointer to store float data.
+ *
+ * @return     0 if successful.
+ */
+static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr)
+{
+    numpy::int16_to_float(&inference.buffers[inference.buf_select ^ 1][offset], out_ptr, length);
+    return 0;
+}
+
+/**
+ * @brief      Stops audio sampling and releases memory.
+ */
+static void microphone_inference_end(void)
+{
+    PDM.end();
+    free(inference.buffers[0]);
+    free(inference.buffers[1]);
+    free(sampleBuffer);
+}
+
+#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_MICROPHONE
+#error "Invalid model for current sensor."
+#endif
